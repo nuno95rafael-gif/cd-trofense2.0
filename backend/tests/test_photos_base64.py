@@ -1,17 +1,14 @@
 """
-CD Trofense — Iteration 8 tests: Photos as base64 in MongoDB
-(removal of Emergent Object Storage dependency).
+CD Trofense — Photos stored in Supabase Storage (metadata in Postgres).
 
 Covers:
 - POST /api/athletes/{aid}/photos → doc created with content_type + size,
-  response does NOT include data_base64.
-- GET /api/athletes/{aid}/photos → payload never contains data_base64.
+  response does NOT include storage_path.
+- GET /api/athletes/{aid}/photos → payload never contains storage_path.
 - GET /api/photos/{pid}/download → returns correct JPEG/PNG magic bytes,
-  works for both migrated (old storage_path) and new (base64-only) photos,
   accepts ?auth=<token> and cookie auth.
 - PUT /api/photos/{pid}/replace → next download returns the new image.
 - DELETE /api/photos/{pid} → subsequent download returns 404.
-- POST /api/admin/migrate-photos → idempotent structure {migrated, total_pending, failed}.
 - Upload >10MB → 413.
 """
 
@@ -122,7 +119,7 @@ class TestPhotoUpload:
         assert body["content_type"] == "image/jpeg"
         assert body["size"] == len(jpeg)
         assert body["kind"] == "profile"
-        assert "data_base64" not in body, "Response must NOT include data_base64"
+        assert "storage_path" not in body, "Response must NOT include storage_path"
         # save for further tests
         TestPhotoUpload._uploaded_id = body["id"]
 
@@ -135,7 +132,7 @@ class TestPhotoUpload:
         assert isinstance(photos, list)
         assert len(photos) > 0, "expected at least the freshly-uploaded photo"
         for p in photos:
-            assert "data_base64" not in p, f"data_base64 leaked in list payload for {p.get('id')}"
+            assert "storage_path" not in p, f"storage_path leaked in list payload for {p.get('id')}"
             # essential fields
             assert "id" in p
             assert "kind" in p
@@ -200,38 +197,6 @@ class TestPhotoDownload:
         r = s.get(f"{BASE_URL}/api/photos/{pid}/download")
         assert r.status_code == 401
 
-    def test_download_migrated_photo(self, api_client, admin_auth):
-        """Any pre-existing photo (previously migrated on startup) must still
-        download correctly and start with the expected image magic bytes."""
-        # Find any athlete with pre-existing photos
-        athletes = api_client.get(f"{BASE_URL}/api/athletes").json()
-        found = None
-        for a in athletes:
-            plist = api_client.get(f"{BASE_URL}/api/athletes/{a['id']}/photos").json()
-            for p in plist:
-                # pick a photo not the one just uploaded in this session
-                if p["id"] != getattr(TestPhotoUpload, "_uploaded_id", None):
-                    found = p
-                    break
-            if found:
-                break
-        if not found:
-            pytest.skip("No pre-existing photos in DB to test migrated download")
-        r = requests.get(
-            f"{BASE_URL}/api/photos/{found['id']}/download",
-            headers={"Authorization": f"Bearer {admin_auth['token']}"},
-        )
-        assert r.status_code == 200, r.text[:200]
-        ctype = r.headers.get("content-type", "")
-        assert ctype.startswith("image/"), f"unexpected content-type {ctype}"
-        magic = r.content[:4]
-        # Accept JPEG, PNG, or WebP
-        assert (
-            magic[:3] == b"\xff\xd8\xff"  # jpeg
-            or magic[:4] == b"\x89PNG"     # png
-            or r.content[:4] == b"RIFF"    # webp
-        ), f"Unexpected image magic bytes: {magic.hex()}"
-
 
 class TestPhotoReplace:
     def test_replace_returns_new_bytes(self, api_client, admin_auth, athlete_id):
@@ -270,21 +235,3 @@ class TestPhotoDelete:
             headers={"Authorization": f"Bearer {admin_auth['token']}"},
         )
         assert d.status_code == 404, f"Expected 404 after delete, got {d.status_code}"
-
-
-class TestMigrationEndpoint:
-    def test_migrate_photos_idempotent(self, api_client, admin_auth):
-        r = api_client.post(f"{BASE_URL}/api/admin/migrate-photos")
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert set(["migrated", "total_pending", "failed"]).issubset(body.keys())
-        # After startup migration, total_pending should be 0
-        assert isinstance(body["migrated"], int)
-        assert isinstance(body["total_pending"], int)
-        assert isinstance(body["failed"], list)
-        # Idempotent: second call still 0 pending
-        r2 = api_client.post(f"{BASE_URL}/api/admin/migrate-photos")
-        assert r2.status_code == 200
-        b2 = r2.json()
-        assert b2["total_pending"] == 0, f"Expected 0 pending on re-run, got {b2}"
-        assert b2["migrated"] == 0

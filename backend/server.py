@@ -6,27 +6,26 @@ load_dotenv(ROOT_DIR / ".env")
 
 import os
 import uuid
+import asyncio
 import logging
+import base64
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 import bcrypt
 import jwt
 import httpx
-import base64
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File, Form, Query, Header
 from fastapi.responses import Response as FastAPIResponse
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 
 from formulas import compute_all
-from storage import get_object, init_storage, content_type_for  # legacy storage kept only for one-time migration
+from db import get_client
 
 # ---------- Setup ----------
-mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
+sb = get_client()
+PHOTOS_BUCKET = "photos"
 
 app = FastAPI(title="CD Trofense API")
 api = APIRouter(prefix="/api")
@@ -37,6 +36,22 @@ ACCESS_TTL_MIN = 60 * 12  # 12 horas
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("trofense")
+
+
+async def db_call(fn):
+    """Executa uma chamada (síncrona) ao cliente Supabase numa thread, para
+    não bloquear o event loop do FastAPI."""
+    return await asyncio.to_thread(fn)
+
+
+def content_type_for(ext: str) -> str:
+    ext = (ext or "").lower().lstrip(".")
+    return {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    }.get(ext, "image/jpeg")
 
 
 # ---------- Helpers ----------
@@ -83,11 +98,11 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Sessão expirada")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token inválido")
-    user = await db.users.find_one({"id": payload["sub"]})
+    res = await db_call(lambda: sb.table("users").select("*").eq("id", payload["sub"]).maybe_single().execute())
+    user = res.data if res else None
     if not user or not user.get("active", True):
         raise HTTPException(status_code=401, detail="Utilizador inválido")
     user.pop("password_hash", None)
-    user.pop("_id", None)
     return user
 
 
@@ -95,13 +110,6 @@ async def require_editor(user: dict = Depends(get_current_user)) -> dict:
     if user.get("role") != "editor":
         raise HTTPException(status_code=403, detail="Apenas editores podem executar esta ação")
     return user
-
-
-def strip_id(doc: Optional[dict]) -> Optional[dict]:
-    if not doc:
-        return None
-    doc.pop("_id", None)
-    return doc
 
 
 # ---------- Models ----------
@@ -200,7 +208,8 @@ async def send_athlete_report(aid: str, body: SendReportIn, user: dict = Depends
             detail="Envio de email não configurado. Peça ao administrador para adicionar RESEND_API_KEY ao backend."
         )
 
-    athlete = await db.athletes.find_one({"id": aid}, {"_id": 0})
+    res = await db_call(lambda: sb.table("athletes").select("*").eq("id", aid).maybe_single().execute())
+    athlete = res.data if res else None
     if not athlete:
         raise HTTPException(status_code=404, detail="Atleta não encontrado")
 
@@ -254,7 +263,6 @@ async def send_athlete_report(aid: str, body: SendReportIn, user: dict = Depends
         return {"ok": True, "email_id": resp.json().get("id")}
     except httpx.HTTPStatusError as e:
         logger.error("send-report failed: %s %s", e.response.status_code, e.response.text)
-        # devolver detalhe do Resend ao user (útil para debugar domínio não verificado, etc)
         try:
             err = e.response.json()
             detail = err.get("message") or err.get("error") or f"HTTP {e.response.status_code}"
@@ -270,7 +278,8 @@ async def send_athlete_report(aid: str, body: SendReportIn, user: dict = Depends
 @api.post("/auth/login")
 async def login(body: LoginIn, response: Response):
     email = body.email.lower().strip()
-    user = await db.users.find_one({"email": email})
+    res = await db_call(lambda: sb.table("users").select("*").eq("email", email).maybe_single().execute())
+    user = res.data if res else None
     if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Credenciais inválidas")
     if not user.get("active", True):
@@ -286,7 +295,6 @@ async def login(body: LoginIn, response: Response):
         path="/",
     )
     user.pop("password_hash", None)
-    user.pop("_id", None)
     return {"user": user, "token": token}
 
 
@@ -304,14 +312,15 @@ async def me(user: dict = Depends(get_current_user)):
 # ---------- Users (editor only) ----------
 @api.get("/users")
 async def list_users(_: dict = Depends(require_editor)):
-    docs = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(500)
-    return docs
+    res = await db_call(lambda: sb.table("users").select("id,email,name,role,active,created_at").execute())
+    return res.data
 
 
 @api.post("/users")
 async def create_user(body: UserCreateIn, _: dict = Depends(require_editor)):
     email = body.email.lower().strip()
-    if await db.users.find_one({"email": email}):
+    existing = await db_call(lambda: sb.table("users").select("id").eq("email", email).maybe_single().execute())
+    if existing and existing.data:
         raise HTTPException(status_code=400, detail="Email já existe")
     if body.role not in ("editor", "viewer"):
         raise HTTPException(status_code=400, detail="Papel inválido")
@@ -324,18 +333,18 @@ async def create_user(body: UserCreateIn, _: dict = Depends(require_editor)):
         "password_hash": hash_password(body.password),
         "created_at": now_iso(),
     }
-    await db.users.insert_one(doc)
-    doc.pop("password_hash")
-    doc.pop("_id", None)
-    return doc
+    res = await db_call(lambda: sb.table("users").insert(doc).execute())
+    created = res.data[0]
+    created.pop("password_hash", None)
+    return created
 
 
 @api.patch("/users/{user_id}")
 async def toggle_user(user_id: str, active: bool = Query(...), current: dict = Depends(require_editor)):
     if user_id == current["id"] and not active:
         raise HTTPException(status_code=400, detail="Não pode desativar-se a si próprio")
-    r = await db.users.update_one({"id": user_id}, {"$set": {"active": active}})
-    if r.matched_count == 0:
+    res = await db_call(lambda: sb.table("users").update({"active": active}).eq("id", user_id).execute())
+    if not res.data:
         raise HTTPException(status_code=404, detail="Utilizador não encontrado")
     return {"ok": True}
 
@@ -344,8 +353,8 @@ async def toggle_user(user_id: str, active: bool = Query(...), current: dict = D
 async def delete_user(user_id: str, current: dict = Depends(require_editor)):
     if user_id == current["id"]:
         raise HTTPException(status_code=400, detail="Não pode apagar-se a si próprio")
-    r = await db.users.delete_one({"id": user_id})
-    if r.deleted_count == 0:
+    res = await db_call(lambda: sb.table("users").delete().eq("id", user_id).execute())
+    if not res.data:
         raise HTTPException(status_code=404, detail="Utilizador não encontrado")
     return {"ok": True}
 
@@ -353,22 +362,26 @@ async def delete_user(user_id: str, current: dict = Depends(require_editor)):
 # ---------- Athletes ----------
 @api.get("/athletes")
 async def list_athletes(_: dict = Depends(get_current_user)):
-    docs = await db.athletes.find({}, {"_id": 0}).sort("nome", 1).to_list(1000)
-    # anexar métricas da última avaliação
+    res = await db_call(lambda: sb.table("athletes").select("*").order("nome").execute())
+    docs = res.data
     for a in docs:
-        last = await db.evaluations.find_one(
-            {"athlete_id": a["id"]}, {"_id": 0}, sort=[("date", -1)]
+        last_res = await db_call(
+            lambda aid=a["id"]: sb.table("evaluations").select("metrics,date,peso_kg")
+            .eq("athlete_id", aid).order("date", desc=True).limit(1).execute()
         )
-        if last:
+        if last_res.data:
+            last = last_res.data[0]
             a["last_metrics"] = last.get("metrics")
             a["last_evaluation_date"] = last.get("date")
             a["last_eval_weight"] = last.get("peso_kg")
-        # última pesagem
-        lw = await db.weighins.find_one({"athlete_id": a["id"]}, {"_id": 0}, sort=[("date", -1)])
-        if lw:
+        lw_res = await db_call(
+            lambda aid=a["id"]: sb.table("weighins").select("peso_kg,date")
+            .eq("athlete_id", aid).order("date", desc=True).limit(1).execute()
+        )
+        if lw_res.data:
+            lw = lw_res.data[0]
             a["last_weight"] = lw.get("peso_kg")
             a["last_weight_date"] = lw.get("date")
-        # peso a mostrar: pesagem > avaliação > peso_atual_kg
         a["display_weight"] = (
             a.get("last_weight")
             or a.get("last_eval_weight")
@@ -384,14 +397,14 @@ async def create_athlete(body: AthleteIn, user: dict = Depends(require_editor)):
     doc["created_at"] = now_iso()
     doc["created_by"] = user["id"]
     doc["goal"] = None
-    await db.athletes.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    res = await db_call(lambda: sb.table("athletes").insert(doc).execute())
+    return res.data[0]
 
 
 @api.get("/athletes/{aid}")
 async def get_athlete(aid: str, _: dict = Depends(get_current_user)):
-    a = await db.athletes.find_one({"id": aid}, {"_id": 0})
+    res = await db_call(lambda: sb.table("athletes").select("*").eq("id", aid).maybe_single().execute())
+    a = res.data if res else None
     if not a:
         raise HTTPException(status_code=404, detail="Atleta não encontrado")
     return a
@@ -399,19 +412,21 @@ async def get_athlete(aid: str, _: dict = Depends(get_current_user)):
 
 @api.put("/athletes/{aid}")
 async def update_athlete(aid: str, body: AthleteIn, _: dict = Depends(require_editor)):
-    r = await db.athletes.update_one({"id": aid}, {"$set": body.model_dump()})
-    if r.matched_count == 0:
+    res = await db_call(lambda: sb.table("athletes").update(body.model_dump()).eq("id", aid).execute())
+    if not res.data:
         raise HTTPException(status_code=404, detail="Atleta não encontrado")
-    a = await db.athletes.find_one({"id": aid}, {"_id": 0})
-    return a
+    return res.data[0]
 
 
 @api.delete("/athletes/{aid}")
 async def delete_athlete(aid: str, _: dict = Depends(require_editor)):
-    await db.athletes.delete_one({"id": aid})
-    await db.evaluations.delete_many({"athlete_id": aid})
-    await db.weighins.delete_many({"athlete_id": aid})
-    await db.photos.delete_many({"athlete_id": aid})
+    # remove os ficheiros do storage antes de apagar o atleta (as linhas de
+    # evaluations/weighins/photos são removidas em cascata pela BD)
+    photos_res = await db_call(lambda: sb.table("photos").select("storage_path").eq("athlete_id", aid).execute())
+    paths = [p["storage_path"] for p in photos_res.data if p.get("storage_path")]
+    if paths:
+        await db_call(lambda: sb.storage.from_(PHOTOS_BUCKET).remove(paths))
+    await db_call(lambda: sb.table("athletes").delete().eq("id", aid).execute())
     return {"ok": True}
 
 
@@ -424,32 +439,35 @@ async def set_goal(aid: str, body: GoalIn, _: dict = Depends(require_editor)):
         "primary_metric": primary,
         "updated_at": now_iso(),
     }
-    r = await db.athletes.update_one({"id": aid}, {"$set": {"goal": goal_doc}})
-    if r.matched_count == 0:
+    res = await db_call(lambda: sb.table("athletes").update({"goal": goal_doc}).eq("id", aid).execute())
+    if not res.data:
         raise HTTPException(status_code=404, detail="Atleta não encontrado")
     return {"ok": True}
 
 
 @api.post("/athletes/{aid}/recompute")
 async def recompute_metrics(aid: str, _: dict = Depends(require_editor)):
-    a = await db.athletes.find_one({"id": aid}, {"_id": 0})
+    res = await db_call(lambda: sb.table("athletes").select("*").eq("id", aid).maybe_single().execute())
+    a = res.data if res else None
     if not a:
         raise HTTPException(status_code=404, detail="Atleta não encontrado")
-    evs = await db.evaluations.find({"athlete_id": aid}, {"_id": 0}).to_list(500)
+    evs_res = await db_call(lambda: sb.table("evaluations").select("*").eq("athlete_id", aid).execute())
+    evs = evs_res.data
     for e in evs:
         m = compute_all(e, a)
-        await db.evaluations.update_one({"id": e["id"]}, {"$set": {"metrics": m}})
+        await db_call(lambda eid=e["id"], m=m: sb.table("evaluations").update({"metrics": m}).eq("id", eid).execute())
     return {"ok": True, "updated": len(evs)}
 
 
 @api.post("/admin/recompute-all")
 async def recompute_all(_: dict = Depends(require_editor)):
     total = 0
-    async for a in db.athletes.find({}, {"_id": 0}):
-        evs = await db.evaluations.find({"athlete_id": a["id"]}, {"_id": 0}).to_list(500)
-        for e in evs:
+    athletes_res = await db_call(lambda: sb.table("athletes").select("*").execute())
+    for a in athletes_res.data:
+        evs_res = await db_call(lambda aid=a["id"]: sb.table("evaluations").select("*").eq("athlete_id", aid).execute())
+        for e in evs_res.data:
             m = compute_all(e, a)
-            await db.evaluations.update_one({"id": e["id"]}, {"$set": {"metrics": m}})
+            await db_call(lambda eid=e["id"], m=m: sb.table("evaluations").update({"metrics": m}).eq("id", eid).execute())
             total += 1
     return {"ok": True, "updated": total}
 
@@ -460,8 +478,8 @@ async def _enrich_user_names(docs: list) -> list:
     ids = list({d["created_by"] for d in docs if d.get("created_by")})
     if not ids:
         return docs
-    users = await db.users.find({"id": {"$in": ids}}, {"_id": 0, "id": 1, "name": 1, "email": 1}).to_list(len(ids))
-    name_by_id = {u["id"]: (u.get("name") or u.get("email") or "—") for u in users}
+    res = await db_call(lambda: sb.table("users").select("id,name,email").in_("id", ids).execute())
+    name_by_id = {u["id"]: (u.get("name") or u.get("email") or "—") for u in res.data}
     for d in docs:
         if d.get("created_by"):
             d["created_by_name"] = name_by_id.get(d["created_by"], "—")
@@ -470,13 +488,14 @@ async def _enrich_user_names(docs: list) -> list:
 
 @api.get("/athletes/{aid}/evaluations")
 async def list_evaluations(aid: str, _: dict = Depends(get_current_user)):
-    docs = await db.evaluations.find({"athlete_id": aid}, {"_id": 0}).sort("date", 1).to_list(500)
-    return await _enrich_user_names(docs)
+    res = await db_call(lambda: sb.table("evaluations").select("*").eq("athlete_id", aid).order("date").execute())
+    return await _enrich_user_names(res.data)
 
 
 @api.post("/athletes/{aid}/evaluations")
 async def create_evaluation(aid: str, body: EvaluationIn, user: dict = Depends(require_editor)):
-    athlete = await db.athletes.find_one({"id": aid}, {"_id": 0})
+    ath_res = await db_call(lambda: sb.table("athletes").select("*").eq("id", aid).maybe_single().execute())
+    athlete = ath_res.data if ath_res else None
     if not athlete:
         raise HTTPException(status_code=404, detail="Atleta não encontrado")
     ev = body.model_dump()
@@ -485,16 +504,15 @@ async def create_evaluation(aid: str, body: EvaluationIn, user: dict = Depends(r
     ev["created_at"] = now_iso()
     ev["created_by"] = user["id"]
     ev["metrics"] = compute_all(ev, athlete)
-    await db.evaluations.insert_one(ev)
-    ev.pop("_id", None)
-    # enrich with user name for immediate UI
-    await _enrich_user_names([ev])
-    return ev
+    res = await db_call(lambda: sb.table("evaluations").insert(ev).execute())
+    created = res.data[0]
+    await _enrich_user_names([created])
+    return created
 
 
 @api.delete("/evaluations/{eid}")
 async def delete_evaluation(eid: str, _: dict = Depends(require_editor)):
-    await db.evaluations.delete_one({"id": eid})
+    await db_call(lambda: sb.table("evaluations").delete().eq("id", eid).execute())
     return {"ok": True}
 
 
@@ -502,18 +520,20 @@ async def delete_evaluation(eid: str, _: dict = Depends(require_editor)):
 async def update_evaluation(eid: str, body: EvaluationIn, user: dict = Depends(require_editor)):
     """Edita uma avaliação existente. Recalcula automaticamente todas as métricas
     contra os dados atuais do atleta e atualiza o campo `updated_at` + `updated_by`."""
-    existing = await db.evaluations.find_one({"id": eid}, {"_id": 0})
+    existing_res = await db_call(lambda: sb.table("evaluations").select("*").eq("id", eid).maybe_single().execute())
+    existing = existing_res.data if existing_res else None
     if not existing:
         raise HTTPException(status_code=404, detail="Avaliação não encontrada")
-    athlete = await db.athletes.find_one({"id": existing["athlete_id"]}, {"_id": 0})
+    ath_res = await db_call(lambda: sb.table("athletes").select("*").eq("id", existing["athlete_id"]).maybe_single().execute())
+    athlete = ath_res.data if ath_res else None
     if not athlete:
         raise HTTPException(status_code=404, detail="Atleta não encontrado")
     upd = body.model_dump()
     upd["metrics"] = compute_all(upd, athlete)
     upd["updated_at"] = now_iso()
     upd["updated_by"] = user["id"]
-    await db.evaluations.update_one({"id": eid}, {"$set": upd})
-    ev = await db.evaluations.find_one({"id": eid}, {"_id": 0})
+    res = await db_call(lambda: sb.table("evaluations").update(upd).eq("id", eid).execute())
+    ev = res.data[0]
     await _enrich_user_names([ev])
     return ev
 
@@ -529,8 +549,8 @@ async def preview_metrics(body: dict, _: dict = Depends(get_current_user)):
 # ---------- Weighins ----------
 @api.get("/athletes/{aid}/weighins")
 async def list_weighins(aid: str, _: dict = Depends(get_current_user)):
-    docs = await db.weighins.find({"athlete_id": aid}, {"_id": 0}).sort("date", 1).to_list(2000)
-    return docs
+    res = await db_call(lambda: sb.table("weighins").select("*").eq("athlete_id", aid).order("date").execute())
+    return res.data
 
 
 @api.post("/athletes/{aid}/weighins")
@@ -540,14 +560,13 @@ async def create_weighin(aid: str, body: WeighinIn, user: dict = Depends(require
     doc["athlete_id"] = aid
     doc["created_at"] = now_iso()
     doc["created_by"] = user["id"]
-    await db.weighins.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    res = await db_call(lambda: sb.table("weighins").insert(doc).execute())
+    return res.data[0]
 
 
 @api.delete("/weighins/{wid}")
 async def delete_weighin(wid: str, _: dict = Depends(require_editor)):
-    await db.weighins.delete_one({"id": wid})
+    await db_call(lambda: sb.table("weighins").delete().eq("id", wid).execute())
     return {"ok": True}
 
 
@@ -556,11 +575,9 @@ async def list_all_weighins(days: int = 60, _: dict = Depends(get_current_user))
     """Devolve todas as pesagens recentes (últimos N dias) com nome do atleta."""
     from datetime import datetime, timedelta, timezone as tz
     cutoff = (datetime.now(tz.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    weighins = await db.weighins.find(
-        {"date": {"$gte": cutoff}}, {"_id": 0}
-    ).sort("date", -1).to_list(5000)
-    athletes = await db.athletes.find({}, {"_id": 0, "id": 1, "nome": 1, "posicao": 1}).to_list(500)
-    return {"athletes": athletes, "weighins": weighins}
+    w_res = await db_call(lambda: sb.table("weighins").select("*").gte("date", cutoff).order("date", desc=True).execute())
+    a_res = await db_call(lambda: sb.table("athletes").select("id,nome,posicao").execute())
+    return {"athletes": a_res.data, "weighins": w_res.data}
 
 
 @api.post("/weighins/import")
@@ -616,7 +633,8 @@ async def import_weighins(
         body.columns = headers
         dfs.append(body)
 
-    athletes = await db.athletes.find({}, {"_id": 0, "id": 1, "nome": 1}).to_list(2000)
+    athletes_res = await db_call(lambda: sb.table("athletes").select("id,nome").execute())
+    athletes = athletes_res.data
     name_to_id = {a["nome"].strip().lower(): a["id"] for a in athletes}
     # Índice auxiliar: primeiro-nome (token único) → id, apenas quando é único.
     # Permite fazer match de "Emerson" → "Emerson Santos", "Mateus" → "Mateus Andrade", etc.
@@ -637,18 +655,15 @@ async def import_weighins(
         key = nome.strip().lower()
         if key in name_to_id:
             return name_to_id[key]
-        # tokens = 1 → tentar primeiro nome único
         tokens = key.split()
         if len(tokens) == 1 and tokens[0] in first_to_id:
             return first_to_id[tokens[0]]
-        # padrão "A.Granja" ou "A. Granja"
         if "." in key:
             parts = [p.strip() for p in key.replace(".", " ").split() if p.strip()]
             if len(parts) == 2:
                 initial, last = parts
                 last_id = last_to_id.get(last)
                 if last_id:
-                    # confirma que o primeiro nome começa por essa inicial
                     for a in athletes:
                         if a["id"] == last_id and a["nome"].strip().lower().startswith(initial):
                             return last_id
@@ -688,8 +703,8 @@ async def import_weighins(
             skipped.append(f"{nome} {date_str}: peso inválido ({peso})")
             return
         # remove pesagem no mesmo dia (evita duplicados no re-import)
-        await db.weighins.delete_many({"athlete_id": aid, "date": date_str})
-        await db.weighins.insert_one({
+        await db_call(lambda: sb.table("weighins").delete().eq("athlete_id", aid).eq("date", date_str).execute())
+        await db_call(lambda: sb.table("weighins").insert({
             "id": new_id(),
             "athlete_id": aid,
             "date": date_str,
@@ -697,7 +712,7 @@ async def import_weighins(
             "created_at": now_iso(),
             "created_by": user["id"],
             "imported": True,
-        })
+        }).execute())
         created += 1
 
     processed_any = False
@@ -764,21 +779,19 @@ async def import_weighins(
 
 
 # ---------- Photos ----------
-# Fotos são armazenadas como base64 direto no MongoDB (campo `data_base64`).
-# Isto elimina a dependência de object storage externo e permite deploy em
-# qualquer provider (Render, Vercel, Railway, etc). O campo `data_base64` é
-# omitido das respostas de listagem para não sobrecarregar o payload.
+# Fotos são guardadas no Supabase Storage (bucket privado "photos"); a tabela
+# `photos` guarda apenas metadata + o caminho no storage (`storage_path`).
 
-PHOTO_LIST_PROJECTION = {"_id": 0, "data_base64": 0}
+PHOTO_LIST_COLUMNS = "id,athlete_id,evaluation_id,date,kind,content_type,size,is_deleted,created_at,created_by"
 
 
 @api.get("/athletes/{aid}/photos")
 async def list_photos(aid: str, _: dict = Depends(get_current_user)):
-    docs = await db.photos.find(
-        {"athlete_id": aid, "is_deleted": {"$ne": True}},
-        PHOTO_LIST_PROJECTION,
-    ).sort("date", 1).to_list(1000)
-    return docs
+    res = await db_call(
+        lambda: sb.table("photos").select(PHOTO_LIST_COLUMNS)
+        .eq("athlete_id", aid).eq("is_deleted", False).order("date").execute()
+    )
+    return res.data
 
 
 @api.post("/athletes/{aid}/photos")
@@ -795,7 +808,7 @@ async def upload_photo(
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Ficheiro vazio")
-    # Limite de segurança: 10 MB por foto (MongoDB doc limit é 16 MB)
+    # Limite de segurança: 10 MB por foto
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Foto demasiado grande (máx 10 MB)")
     ext = (file.filename or "").split(".")[-1].lower() or "jpg"
@@ -803,6 +816,8 @@ async def upload_photo(
         ext = "jpg"
     ctype = content_type_for(ext)
     photo_id = new_id()
+    storage_path = f"{aid}/{photo_id}.{ext}"
+    await db_call(lambda: sb.storage.from_(PHOTOS_BUCKET).upload(storage_path, data, {"content-type": ctype}))
     doc = {
         "id": photo_id,
         "athlete_id": aid,
@@ -811,15 +826,15 @@ async def upload_photo(
         "kind": kind,
         "content_type": ctype,
         "size": len(data),
-        "data_base64": base64.b64encode(data).decode("ascii"),
+        "storage_path": storage_path,
         "is_deleted": False,
         "created_at": now_iso(),
         "created_by": user["id"],
     }
-    await db.photos.insert_one(doc)
-    doc.pop("_id", None)
-    doc.pop("data_base64", None)  # não devolvemos o payload pesado
-    return doc
+    res = await db_call(lambda: sb.table("photos").insert(doc).execute())
+    created = dict(res.data[0])
+    created.pop("storage_path", None)
+    return created
 
 
 @api.patch("/photos/{pid}")
@@ -835,15 +850,16 @@ async def update_photo(pid: str, body: dict, _: dict = Depends(require_editor)):
         upd["date"] = body["date"]
     if not upd:
         return {"ok": True}
-    r = await db.photos.update_one({"id": pid}, {"$set": upd})
-    if r.matched_count == 0:
+    res = await db_call(lambda: sb.table("photos").update(upd).eq("id", pid).execute())
+    if not res.data:
         raise HTTPException(status_code=404, detail="Foto não encontrada")
     return {"ok": True}
 
 
 @api.put("/photos/{pid}/replace")
 async def replace_photo(pid: str, file: UploadFile = File(...), _: dict = Depends(require_editor)):
-    doc = await db.photos.find_one({"id": pid}, {"_id": 0})
+    res = await db_call(lambda: sb.table("photos").select("*").eq("id", pid).maybe_single().execute())
+    doc = res.data if res else None
     if not doc:
         raise HTTPException(status_code=404, detail="Foto não encontrada")
     data = await file.read()
@@ -855,45 +871,20 @@ async def replace_photo(pid: str, file: UploadFile = File(...), _: dict = Depend
     if ext not in ("jpg", "jpeg", "png", "webp"):
         ext = "jpg"
     ctype = content_type_for(ext)
-    await db.photos.update_one({"id": pid}, {"$set": {
+    await db_call(lambda: sb.storage.from_(PHOTOS_BUCKET).upload(
+        doc["storage_path"], data, {"content-type": ctype, "upsert": "true"}
+    ))
+    await db_call(lambda: sb.table("photos").update({
         "content_type": ctype,
         "size": len(data),
-        "data_base64": base64.b64encode(data).decode("ascii"),
-        "updated_at": now_iso(),
-    }, "$unset": {"storage_path": ""}})
+    }).eq("id", pid).execute())
     return {"ok": True}
 
 
 async def _load_photo_bytes(doc: dict) -> tuple[bytes, str]:
-    """Devolve (bytes, content_type). Suporta fotos armazenadas em base64
-    (novo formato) e faz migração lazy das antigas em object storage."""
     ctype = doc.get("content_type") or "image/jpeg"
-    b64 = doc.get("data_base64")
-    if b64:
-        try:
-            return base64.b64decode(b64), ctype
-        except Exception:
-            raise HTTPException(status_code=500, detail="Dados de imagem corrompidos")
-    # Fallback legado: object storage → migra para base64 no acesso
-    storage_path = doc.get("storage_path")
-    if not storage_path:
-        raise HTTPException(status_code=404, detail="Foto sem dados")
-    try:
-        data, legacy_ctype = get_object(storage_path)
-    except Exception as e:
-        logger.error("Legacy photo fetch failed for %s: %s", doc.get("id"), e)
-        raise HTTPException(status_code=502, detail="Não foi possível carregar a foto (storage indisponível)")
-    # Persistir na coleção para futuros acessos
-    await db.photos.update_one(
-        {"id": doc["id"]},
-        {"$set": {
-            "data_base64": base64.b64encode(data).decode("ascii"),
-            "content_type": ctype or legacy_ctype,
-            "size": len(data),
-            "migrated_at": now_iso(),
-        }},
-    )
-    return data, ctype or legacy_ctype
+    data = await db_call(lambda: sb.storage.from_(PHOTOS_BUCKET).download(doc["storage_path"]))
+    return data, ctype
 
 
 @api.get("/photos/{pid}/download")
@@ -910,47 +901,21 @@ async def download_photo(pid: str, request: Request, auth: Optional[str] = Query
         jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except Exception:
         raise HTTPException(status_code=401, detail="Token inválido")
-    doc = await db.photos.find_one({"id": pid, "is_deleted": {"$ne": True}}, {"_id": 0})
+    res = await db_call(lambda: sb.table("photos").select("*").eq("id", pid).eq("is_deleted", False).maybe_single().execute())
+    doc = res.data if res else None
     if not doc:
         raise HTTPException(status_code=404, detail="Foto não encontrada")
-    data, ctype = await _load_photo_bytes(doc)
+    try:
+        data, ctype = await _load_photo_bytes(doc)
+    except Exception as e:
+        logger.error("Falha ao carregar foto %s: %s", pid, e)
+        raise HTTPException(status_code=502, detail="Não foi possível carregar a foto")
     return FastAPIResponse(content=data, media_type=ctype)
-
-
-@api.post("/admin/migrate-photos")
-async def migrate_photos(_: dict = Depends(require_editor)):
-    """Migra todas as fotos legacy (armazenadas em Emergent Object Storage)
-    para base64 no MongoDB. Executar uma vez antes de mudar de plataforma
-    de hosting. Idempotente: fotos já migradas são ignoradas."""
-    q = {
-        "is_deleted": {"$ne": True},
-        "storage_path": {"$exists": True},
-        "$or": [{"data_base64": {"$exists": False}}, {"data_base64": None}],
-    }
-    docs = await db.photos.find(q, {"_id": 0}).to_list(5000)
-    migrated = 0
-    failed: list[dict] = []
-    for d in docs:
-        try:
-            data, legacy_ctype = get_object(d["storage_path"])
-            await db.photos.update_one(
-                {"id": d["id"]},
-                {"$set": {
-                    "data_base64": base64.b64encode(data).decode("ascii"),
-                    "content_type": d.get("content_type") or legacy_ctype,
-                    "size": len(data),
-                    "migrated_at": now_iso(),
-                }},
-            )
-            migrated += 1
-        except Exception as e:
-            failed.append({"id": d["id"], "error": str(e)})
-    return {"migrated": migrated, "total_pending": len(docs), "failed": failed}
 
 
 @api.delete("/photos/{pid}")
 async def delete_photo(pid: str, _: dict = Depends(require_editor)):
-    await db.photos.update_one({"id": pid}, {"$set": {"is_deleted": True}})
+    await db_call(lambda: sb.table("photos").update({"is_deleted": True}).eq("id", pid).execute())
     return {"ok": True}
 
 
@@ -958,17 +923,29 @@ async def delete_photo(pid: str, _: dict = Depends(require_editor)):
 @api.get("/backup/export")
 async def backup_export(_: dict = Depends(require_editor)):
     """Backup completo com fotos em base64 (para restore noutro ambiente)."""
-    athletes = await db.athletes.find({}, {"_id": 0}).to_list(5000)
-    evaluations = await db.evaluations.find({}, {"_id": 0}).to_list(50000)
-    weighins = await db.weighins.find({}, {"_id": 0}).to_list(100000)
-    # Photos: incluir data_base64 (podem ser grandes — backup pode chegar às centenas de MB)
-    photos = await db.photos.find({"is_deleted": {"$ne": True}}, {"_id": 0}).to_list(50000)
+    athletes_res = await db_call(lambda: sb.table("athletes").select("*").execute())
+    evaluations_res = await db_call(lambda: sb.table("evaluations").select("*").execute())
+    weighins_res = await db_call(lambda: sb.table("weighins").select("*").execute())
+    photos_res = await db_call(lambda: sb.table("photos").select("*").eq("is_deleted", False).execute())
+
+    photos = []
+    for p in photos_res.data:
+        p = dict(p)
+        storage_path = p.pop("storage_path", None)
+        try:
+            data = await db_call(lambda sp=storage_path: sb.storage.from_(PHOTOS_BUCKET).download(sp))
+            p["data_base64"] = base64.b64encode(data).decode("ascii")
+        except Exception as e:
+            logger.warning("Backup: falha ao ler foto %s do storage: %s", p.get("id"), e)
+            p["data_base64"] = None
+        photos.append(p)
+
     return {
         "version": 1,
         "exported_at": now_iso(),
-        "athletes": athletes,
-        "evaluations": evaluations,
-        "weighins": weighins,
+        "athletes": athletes_res.data,
+        "evaluations": evaluations_res.data,
+        "weighins": weighins_res.data,
         "photos": photos,
     }
 
@@ -980,8 +957,8 @@ async def backup_import(body: dict, user: dict = Depends(require_editor)):
       o id; se não existe, insere com o id do JSON.
     - Avaliações: match por (athlete_id, date) — ignora duplicados.
     - Pesagens: match por (athlete_id, date) — ignora duplicados.
-    - Fotos: match por (athlete_id, date, kind) — ignora duplicados. Aceita photos com
-      `data_base64` (novo formato) ou `storage_path` (legacy, será apenas metadata).
+    - Fotos: match por (athlete_id, date, kind) — ignora duplicados. Requer `data_base64`
+      (o backup é reenviado para o Supabase Storage).
     Devolve contagens do que foi inserido e ignorado.
     """
     stats = {
@@ -992,13 +969,11 @@ async def backup_import(body: dict, user: dict = Depends(require_editor)):
         "errors": [],
     }
 
-    # 1) Atletas — construir mapa old_id -> new_id
-    # Carrega todos os atletas atuais e compara nomes normalizados em Python
-    # (mais robusto para trailing whitespace, case, acentos, parênteses, etc)
-    existing_athletes = await db.athletes.find({}, {"_id": 0, "id": 1, "nome": 1}).to_list(5000)
+    existing_res = await db_call(lambda: sb.table("athletes").select("id,nome").execute())
+
     def _norm_name(s: str) -> str:
         return " ".join((s or "").strip().split()).lower()
-    existing_by_name: dict[str, str] = {_norm_name(a["nome"]): a["id"] for a in existing_athletes}
+    existing_by_name: dict[str, str] = {_norm_name(a["nome"]): a["id"] for a in existing_res.data}
 
     id_map: dict[str, str] = {}
     incoming_athletes = body.get("athletes") or []
@@ -1014,14 +989,13 @@ async def backup_import(body: dict, user: dict = Depends(require_editor)):
                 id_map[a.get("id", "")] = existing_id
                 stats["athletes"]["matched"] += 1
                 continue
-            new_a = dict(a)
-            new_a.pop("_id", None)
-            new_a.setdefault("id", new_id())
-            new_a.setdefault("created_at", now_iso())
-            new_a.setdefault("created_by", user["id"])
-            await db.athletes.insert_one(new_a)
+            new_a = {k: v for k, v in a.items() if k not in ("id", "created_at", "created_by")}
+            new_a["id"] = new_id()
+            new_a["created_at"] = now_iso()
+            new_a["created_by"] = user["id"]
+            await db_call(lambda new_a=new_a: sb.table("athletes").insert(new_a).execute())
             id_map[a.get("id", "")] = new_a["id"]
-            existing_by_name[key] = new_a["id"]  # protege contra dupes no próprio JSON
+            existing_by_name[key] = new_a["id"]
             stats["athletes"]["inserted"] += 1
         except Exception as e:
             stats["errors"].append(f"atleta {a.get('nome','?')}: {e}")
@@ -1030,6 +1004,7 @@ async def backup_import(body: dict, user: dict = Depends(require_editor)):
         return id_map.get(old_aid) or (old_aid if old_aid else None)
 
     # 2) Avaliações — merge por (athlete_id, date)
+    athletes_cache: dict[str, dict] = {}
     for ev in body.get("evaluations") or []:
         try:
             aid = _resolve_aid(ev.get("athlete_id", ""))
@@ -1038,21 +1013,25 @@ async def backup_import(body: dict, user: dict = Depends(require_editor)):
             date = ev.get("date")
             if not date:
                 continue
-            existing = await db.evaluations.find_one({"athlete_id": aid, "date": date}, {"_id": 0, "id": 1})
-            if existing:
+            existing = await db_call(
+                lambda aid=aid, date=date: sb.table("evaluations").select("id")
+                .eq("athlete_id", aid).eq("date", date).maybe_single().execute()
+            )
+            if existing and existing.data:
                 stats["evaluations"]["skipped"] += 1
                 continue
-            doc = dict(ev)
-            doc.pop("_id", None)
+            doc = {k: v for k, v in ev.items() if k not in ("id", "created_at", "created_by")}
             doc["athlete_id"] = aid
-            doc.setdefault("id", new_id())
-            doc.setdefault("created_at", now_iso())
-            doc.setdefault("created_by", user["id"])
-            # Recalcula métricas contra o atleta atual (garante consistência)
-            ath = await db.athletes.find_one({"id": aid}, {"_id": 0})
+            doc["id"] = new_id()
+            doc["created_at"] = now_iso()
+            doc["created_by"] = user["id"]
+            if aid not in athletes_cache:
+                ath_res = await db_call(lambda aid=aid: sb.table("athletes").select("*").eq("id", aid).maybe_single().execute())
+                athletes_cache[aid] = ath_res.data if ath_res else None
+            ath = athletes_cache[aid]
             if ath:
                 doc["metrics"] = compute_all(doc, ath)
-            await db.evaluations.insert_one(doc)
+            await db_call(lambda doc=doc: sb.table("evaluations").insert(doc).execute())
             stats["evaluations"]["inserted"] += 1
         except Exception as e:
             stats["errors"].append(f"avaliação {ev.get('date','?')}: {e}")
@@ -1063,17 +1042,19 @@ async def backup_import(body: dict, user: dict = Depends(require_editor)):
             aid = _resolve_aid(w.get("athlete_id", ""))
             if not aid or not w.get("date") or w.get("peso_kg") is None:
                 continue
-            existing = await db.weighins.find_one({"athlete_id": aid, "date": w["date"]}, {"_id": 0, "id": 1})
-            if existing:
+            existing = await db_call(
+                lambda aid=aid, date=w["date"]: sb.table("weighins").select("id")
+                .eq("athlete_id", aid).eq("date", date).maybe_single().execute()
+            )
+            if existing and existing.data:
                 stats["weighins"]["skipped"] += 1
                 continue
-            doc = dict(w)
-            doc.pop("_id", None)
+            doc = {k: v for k, v in w.items() if k not in ("id", "created_at", "created_by")}
             doc["athlete_id"] = aid
-            doc.setdefault("id", new_id())
-            doc.setdefault("created_at", now_iso())
-            doc.setdefault("created_by", user["id"])
-            await db.weighins.insert_one(doc)
+            doc["id"] = new_id()
+            doc["created_at"] = now_iso()
+            doc["created_by"] = user["id"]
+            await db_call(lambda doc=doc: sb.table("weighins").insert(doc).execute())
             stats["weighins"]["inserted"] += 1
         except Exception as e:
             stats["errors"].append(f"pesagem {w.get('date','?')}: {e}")
@@ -1084,24 +1065,38 @@ async def backup_import(body: dict, user: dict = Depends(require_editor)):
             aid = _resolve_aid(p.get("athlete_id", ""))
             if not aid or not p.get("date") or not p.get("kind"):
                 continue
-            existing = await db.photos.find_one(
-                {"athlete_id": aid, "date": p["date"], "kind": p["kind"], "is_deleted": {"$ne": True}},
-                {"_id": 0, "id": 1},
+            existing = await db_call(
+                lambda aid=aid, date=p["date"], kind=p["kind"]: sb.table("photos").select("id")
+                .eq("athlete_id", aid).eq("date", date).eq("kind", kind).eq("is_deleted", False)
+                .maybe_single().execute()
             )
-            if existing:
+            if existing and existing.data:
                 stats["photos"]["skipped"] += 1
                 continue
-            if not p.get("data_base64") and not p.get("storage_path"):
+            b64 = p.get("data_base64")
+            if not b64:
                 stats["photos"]["no_data"] += 1
                 continue
-            doc = dict(p)
-            doc.pop("_id", None)
-            doc["athlete_id"] = aid
-            doc.setdefault("id", new_id())
-            doc.setdefault("created_at", now_iso())
-            doc.setdefault("created_by", user["id"])
-            doc.setdefault("is_deleted", False)
-            await db.photos.insert_one(doc)
+            raw = base64.b64decode(b64)
+            ctype = p.get("content_type") or "image/jpeg"
+            ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(ctype, "jpg")
+            photo_id = new_id()
+            storage_path = f"{aid}/{photo_id}.{ext}"
+            await db_call(lambda: sb.storage.from_(PHOTOS_BUCKET).upload(storage_path, raw, {"content-type": ctype}))
+            doc = {
+                "id": photo_id,
+                "athlete_id": aid,
+                "evaluation_id": None,
+                "date": p["date"],
+                "kind": p["kind"],
+                "content_type": ctype,
+                "size": len(raw),
+                "storage_path": storage_path,
+                "is_deleted": False,
+                "created_at": now_iso(),
+                "created_by": user["id"],
+            }
+            await db_call(lambda doc=doc: sb.table("photos").insert(doc).execute())
             stats["photos"]["inserted"] += 1
         except Exception as e:
             stats["errors"].append(f"foto {p.get('date','?')}/{p.get('kind','?')}: {e}")
@@ -1116,7 +1111,8 @@ async def monthly_report(month_a: str, month_b: str, _: dict = Depends(get_curre
     Devolve para cada atleta: altura, peso, %MG (Reilly), IMC, Σ8 pregas,
     massa muscular (Lee) e perímetro médio da coxa (PMC = média de coxaD/E).
     """
-    athletes = await db.athletes.find({}, {"_id": 0}).sort("nome", 1).to_list(1000)
+    res = await db_call(lambda: sb.table("athletes").select("*").order("nome").execute())
+    athletes = res.data
     rows = []
     for a in athletes:
         snap_a = await _month_snapshot(a["id"], month_a)
@@ -1163,11 +1159,12 @@ async def _month_snapshot(aid: str, month: str) -> dict:
     valores vêm exclusivamente da avaliação para garantir coerência entre
     peso, %MG, IMC, Massa Muscular e perímetros."""
     start, end = _month_bounds(month)
-    ev = await db.evaluations.find_one(
-        {"athlete_id": aid, "date": {"$gte": start, "$lt": end}},
-        {"_id": 0},
-        sort=[("date", -1)],
+    res = await db_call(
+        lambda: sb.table("evaluations").select("*")
+        .eq("athlete_id", aid).gte("date", start).lt("date", end)
+        .order("date", desc=True).limit(1).execute()
     )
+    ev = res.data[0] if res.data else None
     m = (ev or {}).get("metrics", {}) if ev else {}
     perims = (ev or {}).get("perimetros", {}) if ev else {}
     coxaD = perims.get("coxaD")
@@ -1195,18 +1192,13 @@ async def _month_snapshot(aid: str, month: str) -> dict:
 # ---------- Startup ----------
 @app.on_event("startup")
 async def startup():
-    await db.users.create_index("email", unique=True)
-    await db.athletes.create_index("nome")
-    await db.evaluations.create_index([("athlete_id", 1), ("date", -1)])
-    await db.weighins.create_index([("athlete_id", 1), ("date", -1)])
-    await db.photos.create_index([("athlete_id", 1), ("date", -1)])
-
     # Seed admin (editor)
     admin_email = os.environ["ADMIN_EMAIL"].lower()
     admin_pwd = os.environ["ADMIN_PASSWORD"]
-    existing = await db.users.find_one({"email": admin_email})
+    res = await db_call(lambda: sb.table("users").select("*").eq("email", admin_email).maybe_single().execute())
+    existing = res.data if res else None
     if not existing:
-        await db.users.insert_one({
+        await db_call(lambda: sb.table("users").insert({
             "id": new_id(),
             "email": admin_email,
             "name": "Admin CD Trofense",
@@ -1214,57 +1206,13 @@ async def startup():
             "active": True,
             "password_hash": hash_password(admin_pwd),
             "created_at": now_iso(),
-        })
+        }).execute())
         logger.info("Admin seeded: %s", admin_email)
     elif not verify_password(admin_pwd, existing["password_hash"]):
-        await db.users.update_one(
-            {"email": admin_email},
-            {"$set": {"password_hash": hash_password(admin_pwd), "active": True}},
-        )
+        await db_call(lambda: sb.table("users").update(
+            {"password_hash": hash_password(admin_pwd), "active": True}
+        ).eq("email", admin_email).execute())
         logger.info("Admin password refreshed for %s", admin_email)
-
-    # Init legacy storage (best-effort, apenas para migrar fotos antigas)
-    try:
-        init_storage()
-    except Exception as e:
-        logger.warning("Legacy storage init failed (ignorável): %s", e)
-
-    # Migração automática de fotos legacy → base64 no MongoDB (best-effort,
-    # não bloqueia o arranque nem falha se o storage antigo estiver offline).
-    try:
-        q = {
-            "is_deleted": {"$ne": True},
-            "storage_path": {"$exists": True},
-            "$or": [{"data_base64": {"$exists": False}}, {"data_base64": None}],
-        }
-        pending = await db.photos.count_documents(q)
-        if pending:
-            logger.info("Photo migration: %d fotos pendentes → base64", pending)
-            docs = await db.photos.find(q, {"_id": 0}).to_list(5000)
-            migrated = 0
-            for d in docs:
-                try:
-                    data, legacy_ctype = get_object(d["storage_path"])
-                    await db.photos.update_one(
-                        {"id": d["id"]},
-                        {"$set": {
-                            "data_base64": base64.b64encode(data).decode("ascii"),
-                            "content_type": d.get("content_type") or legacy_ctype,
-                            "size": len(data),
-                            "migrated_at": now_iso(),
-                        }},
-                    )
-                    migrated += 1
-                except Exception as e:
-                    logger.warning("Photo %s migration failed: %s", d.get("id"), e)
-            logger.info("Photo migration done: %d/%d", migrated, pending)
-    except Exception as e:
-        logger.warning("Photo migration skipped: %s", e)
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    client.close()
 
 
 app.include_router(api)

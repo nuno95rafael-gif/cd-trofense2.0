@@ -1,0 +1,6 @@
+test_reports/
+test_result.md
+memory/
+.emergent/
+backend/tests/
+tests/

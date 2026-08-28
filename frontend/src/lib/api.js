@@ -1,6 +1,9 @@
 import axios from "axios";
 
-const BACKEND = process.env.REACT_APP_BACKEND_URL;
+// Em produção o frontend e o backend vivem no mesmo domínio Vercel, por isso
+// o caminho por omissão é relativo ("/api"). Definir REACT_APP_BACKEND_URL
+// só é necessário em desenvolvimento local (backend noutra porta/domínio).
+const BACKEND = process.env.REACT_APP_BACKEND_URL || "";
 export const API = `${BACKEND}/api`;
 
 export const api = axios.create({

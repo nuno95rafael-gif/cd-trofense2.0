@@ -265,7 +265,7 @@ export async function exportTeamGoalsPdf(rows, counts) {
 async function fetchPhotoAsDataUrl(photoId) {
   try {
     const token = localStorage.getItem("trofense_token");
-    const base = process.env.REACT_APP_BACKEND_URL;
+    const base = process.env.REACT_APP_BACKEND_URL || "";
     const res = await fetch(`${base}/api/photos/${photoId}/download`, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -432,7 +432,7 @@ export async function exportAthletePdf(athlete, evals, weighins, saveFile = true
   let profileDataUrl = null;
   try {
     const token = localStorage.getItem("trofense_token");
-    const base = process.env.REACT_APP_BACKEND_URL;
+    const base = process.env.REACT_APP_BACKEND_URL || "";
     const listRes = await fetch(`${base}/api/athletes/${athlete.id}/photos`, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -730,7 +730,7 @@ export async function exportAthletePdf(athlete, evals, weighins, saveFile = true
   // Fotos da última avaliação (se existirem)
   try {
     const token = localStorage.getItem("trofense_token");
-    const base = process.env.REACT_APP_BACKEND_URL;
+    const base = process.env.REACT_APP_BACKEND_URL || "";
     const listRes = await fetch(`${base}/api/athletes/${athlete.id}/photos`, {
       headers: { Authorization: `Bearer ${token}` },
     });
