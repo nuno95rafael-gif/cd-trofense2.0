@@ -43,7 +43,7 @@ export default function AthleteProfile() {
     setWeighins(w.data);
   };
 
-  useEffect(() => { reload(); /* eslint-disable-next-line */ }, [id]);
+  useEffect(() => { reload(); }, [id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!athlete) return <div className="p-8">A carregar…</div>;
 

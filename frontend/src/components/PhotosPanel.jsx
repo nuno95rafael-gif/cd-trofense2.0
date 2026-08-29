@@ -53,7 +53,7 @@ export function PhotosPanel({ athleteId, evaluations, isEditor }) {
     });
   };
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [athleteId]);
+  useEffect(() => { load(); }, [athleteId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const photosByDateKind = useMemo(() => {
     const map = {};
