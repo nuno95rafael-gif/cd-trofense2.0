@@ -20,7 +20,9 @@ export default function WeighinsHistory() {
   const [q, setQ] = useState("");
   const [deltaFilter, setDeltaFilter] = useState("todos"); // todos | ganhou | perdeu | estavel
   const [uploading, setUploading] = useState(false);
+  const [uploadingTemplate, setUploadingTemplate] = useState(false);
   const fileRef = useRef(null);
+  const templateFileRef = useRef(null);
 
   const load = async () => {
     const { data } = await api.get(`/weighins?days=${days}`);
@@ -110,6 +112,50 @@ export default function WeighinsHistory() {
     }
   };
 
+  const onDownloadTemplate = async () => {
+    try {
+      const res = await fetch(`${API}/templates/pesagens`, {
+        headers: { Authorization: `Bearer ${localStorage.getItem("trofense_token")}` },
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || "Não foi possível descarregar o modelo");
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "Trofense_Modelo_Pesagens.xlsx";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      toast.error(formatApiError(err.message) || "Erro ao descarregar o modelo");
+    }
+  };
+
+  const onUploadTemplate = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingTemplate(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch(`${API}/templates/pesagens`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${localStorage.getItem("trofense_token")}` },
+        body: fd,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Erro ao enviar o modelo");
+      toast.success("Modelo atualizado");
+    } catch (err) {
+      toast.error(formatApiError(err.message) || "Erro ao enviar o modelo");
+    } finally {
+      setUploadingTemplate(false);
+      e.target.value = "";
+    }
+  };
+
   const fmtDate = (d) => {
     const [y, m, day] = d.split("-");
     return `${day}/${m}`;
@@ -127,11 +173,31 @@ export default function WeighinsHistory() {
         </div>
         {isEditor && (
           <div className="flex gap-2 flex-wrap">
-            <a href="https://customer-assets-cm19k8pv.emergentagent.net/job_body-comp/artifacts/86i3vwd8_Trofense_Modelo_Pesagens.xlsx" download>
-              <Button variant="outline" className="gap-2" data-testid="download-template-btn">
-                <Download className="w-4 h-4" /> Descarregar modelo
-              </Button>
-            </a>
+            <Button
+              variant="outline"
+              className="gap-2"
+              onClick={onDownloadTemplate}
+              data-testid="download-template-btn"
+            >
+              <Download className="w-4 h-4" /> Descarregar modelo
+            </Button>
+            <input
+              ref={templateFileRef}
+              type="file"
+              accept=".xlsx,.xls"
+              onChange={onUploadTemplate}
+              className="hidden"
+              data-testid="weighins-template-upload-input"
+            />
+            <Button
+              variant="outline"
+              className="gap-2"
+              onClick={() => templateFileRef.current?.click()}
+              disabled={uploadingTemplate}
+              data-testid="weighins-template-upload-btn"
+            >
+              <Upload className="w-4 h-4" /> {uploadingTemplate ? "A enviar..." : "Atualizar modelo"}
+            </Button>
             <input
               ref={fileRef}
               type="file"

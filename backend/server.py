@@ -933,6 +933,39 @@ async def delete_photo(pid: str, _: dict = Depends(require_editor)):
     return {"ok": True}
 
 
+# ---------- Templates (ex: modelo Excel de pesagens) ----------
+TEMPLATES_BUCKET = "templates"
+PESAGENS_TEMPLATE_PATH = "pesagens-modelo.xlsx"
+XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@api.get("/templates/pesagens")
+async def download_pesagens_template(_: dict = Depends(get_current_user)):
+    try:
+        data = await db_call(lambda: sb.storage.from_(TEMPLATES_BUCKET).download(PESAGENS_TEMPLATE_PATH))
+    except Exception:
+        raise HTTPException(status_code=404, detail="Ainda não foi enviado nenhum modelo. Peça a um editor para o enviar.")
+    return FastAPIResponse(
+        content=data,
+        media_type=XLSX_CONTENT_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="Trofense_Modelo_Pesagens.xlsx"'},
+    )
+
+
+@api.post("/templates/pesagens")
+async def upload_pesagens_template(file: UploadFile = File(...), _: dict = Depends(require_editor)):
+    ext = (file.filename or "").lower().split(".")[-1]
+    if ext not in ("xlsx", "xls"):
+        raise HTTPException(status_code=400, detail="O modelo tem de ser um ficheiro .xlsx ou .xls")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Ficheiro vazio")
+    await db_call(lambda: sb.storage.from_(TEMPLATES_BUCKET).upload(
+        PESAGENS_TEMPLATE_PATH, data, {"content-type": XLSX_CONTENT_TYPE, "upsert": "true"}
+    ))
+    return {"ok": True}
+
+
 # ---------- Backup / Restore ----------
 @api.get("/backup/export")
 async def backup_export(_: dict = Depends(require_editor)):
