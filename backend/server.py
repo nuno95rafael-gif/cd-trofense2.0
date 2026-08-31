@@ -669,7 +669,7 @@ async def import_weighins(
                             return last_id
         return None
 
-    created = 0
+    to_upsert: dict[tuple[str, str], float] = {}
     skipped: list[str] = []
 
     def _parse_date(v) -> str | None:
@@ -687,8 +687,10 @@ async def import_weighins(
                 pass
         return None
 
-    async def _add(nome: str, date_str: str, peso: float):
-        nonlocal created
+    def _add(nome: str, date_str: str, peso: float):
+        """Valida e acumula em memória — a escrita na BD é feita uma única vez
+        no fim, num único upsert em lote (evita milhares de pedidos de rede
+        sequenciais, que em ficheiros grandes excediam o tempo limite da função)."""
         import math
         aid = _resolve_athlete(nome)
         if not aid:
@@ -702,18 +704,8 @@ async def import_weighins(
         if peso_f is None or math.isnan(peso_f) or math.isinf(peso_f) or peso_f <= 0 or peso_f > 300:
             skipped.append(f"{nome} {date_str}: peso inválido ({peso})")
             return
-        # remove pesagem no mesmo dia (evita duplicados no re-import)
-        await db_call(lambda: sb.table("weighins").delete().eq("athlete_id", aid).eq("date", date_str).execute())
-        await db_call(lambda: sb.table("weighins").insert({
-            "id": new_id(),
-            "athlete_id": aid,
-            "date": date_str,
-            "peso_kg": round(peso_f, 2),
-            "created_at": now_iso(),
-            "created_by": user["id"],
-            "imported": True,
-        }).execute())
-        created += 1
+        # última ocorrência do (atleta, data) vence — igual ao comportamento anterior
+        to_upsert[(aid, date_str)] = round(peso_f, 2)
 
     processed_any = False
     for df in dfs:
@@ -736,7 +728,7 @@ async def import_weighins(
                     if not date_str:
                         continue
                     peso = float(row[c_peso])
-                    await _add(nome, date_str, peso)
+                    _add(nome, date_str, peso)
                 except Exception as e:
                     skipped.append(f"linha inválida: {e}")
             continue
@@ -765,7 +757,7 @@ async def import_weighins(
                                 peso = float(str(v).replace(",", "."))
                             except Exception:
                                 continue
-                            await _add(nome, date_str, peso)
+                            _add(nome, date_str, peso)
                     except Exception as e:
                         skipped.append(f"linha inválida: {e}")
 
@@ -775,7 +767,29 @@ async def import_weighins(
             detail="Não encontrei um formato válido. Precisa de Nome/Data/Peso ou Atleta + colunas com datas.",
         )
 
-    return {"created": created, "skipped": skipped}
+    rows = [
+        {
+            # sem "id": deixa a BD gerar; assim uma atualização (mesmo
+            # atleta+data já existente) não muda a chave primária da linha.
+            "athlete_id": aid,
+            "date": date_str,
+            "peso_kg": peso_kg,
+            "created_at": now_iso(),
+            "created_by": user["id"],
+            "imported": True,
+        }
+        for (aid, date_str), peso_kg in to_upsert.items()
+    ]
+    # Um único upsert em lote (substitui pesagens existentes no mesmo dia).
+    # Evita milhares de pedidos sequenciais à BD para ficheiros grandes.
+    if rows:
+        for i in range(0, len(rows), 500):
+            batch = rows[i:i + 500]
+            await db_call(lambda batch=batch: sb.table("weighins").upsert(
+                batch, on_conflict="athlete_id,date"
+            ).execute())
+
+    return {"created": len(rows), "skipped": skipped}
 
 
 # ---------- Photos ----------
